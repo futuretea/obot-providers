@@ -6,14 +6,12 @@ permissions:
   packages: write
 
 on:
-  pull_request:
-    branches:
-      - main
-  push:
-    branches:
-      - main
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag for ghcr.io/futuretea/obot-providers
+        required: true
+        default: latest
 
 jobs:
   build:
@@ -43,7 +41,7 @@ jobs:
           target: providers
           platforms: linux/amd64,linux/arm64
           tags: |
-            ${{ github.ref_type == 'tag' && format('ghcr.io/obot-platform/providers:{0}', github.ref_name) || format('ghcr.io/{0}:latest', github.repository) }}
+            ghcr.io/${{ github.repository }}:${{ inputs.tag }}
 
       - name: Install Cosign
         if: github.event_name != 'pull_request'
@@ -55,7 +53,7 @@ jobs:
         if: github.event_name != 'pull_request'
         env:
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
-          TAGS: ${{ github.ref_type == 'tag' && format('ghcr.io/obot-platform/providers:{0}', github.ref_name) || format('ghcr.io/{0}:latest', github.repository) }}
+          TAGS: ghcr.io/${{ github.repository }}:${{ inputs.tag }}
         run: |
           images=""
           for tag in ${TAGS}; do
