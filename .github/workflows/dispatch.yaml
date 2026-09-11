@@ -1,7 +1,6 @@
 name: Tag Release of providers
 on:
-  repository_dispatch:
-    types: release
+  workflow_dispatch:
 
 jobs:
   tag-release:

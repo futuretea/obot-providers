@@ -1,0 +1,387 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	oauth2proxy "github.com/oauth2-proxy/oauth2-proxy/v7"
+
+	"github.com/obot-platform/providers/auth-providers-common/pkg/icon"
+	"github.com/obot-platform/providers/auth-providers-common/pkg/state"
+	"github.com/obot-platform/providers/keycloak-auth-provider/pkg/client"
+	"github.com/obot-platform/providers/keycloak-auth-provider/pkg/config"
+	"github.com/obot-platform/providers/keycloak-auth-provider/pkg/profile"
+)
+
+const bearerPrefix = "Bearer "
+
+// groupClaimNames defines JWT claim names for group membership (checked in order).
+// IMPORTANT: full_group_path must be checked first because it contains the complete
+// path (e.g., "/developers") which matches the format used by ListAuthGroups.
+// The "groups" claim may only contain group names without path prefix (e.g., "developers"),
+// causing ACR permission checks to fail due to ID mismatch.
+var groupClaimNames = []string{"full_group_path", "groups"}
+
+// Handlers provides HTTP handlers for keycloak-auth-provider endpoints
+type Handlers struct {
+	oauthProxy    *oauth2proxy.OAuthProxy
+	config        *config.Config
+	serviceClient *client.ServiceAccountClient
+}
+
+// New creates a Handlers instance with the given OAuth proxy and configuration
+func New(oauthProxy *oauth2proxy.OAuthProxy, cfg *config.Config) *Handlers {
+	return &Handlers{
+		oauthProxy:    oauthProxy,
+		config:        cfg,
+		serviceClient: client.NewServiceAccountClient(cfg.IssuerURL, cfg.ClientID, cfg.ClientSecret),
+	}
+}
+
+// responseWriter wraps http.ResponseWriter to capture status code
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+// Compile-time interface verification
+var _ http.ResponseWriter = (*responseWriter)(nil)
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+// LoggingMiddleware returns a middleware that logs all incoming requests at DEBUG level
+func (h *Handlers) LoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !h.config.Debug {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		start := time.Now()
+
+		// Log request details
+		h.logDebug(">>> %s %s", r.Method, r.URL.String())
+		h.logDebug("    Host: %s", r.Host)
+		h.logDebug("    RemoteAddr: %s", r.RemoteAddr)
+
+		// Log selected headers (avoid logging sensitive data in full)
+		for _, header := range []string{"Content-Type", "User-Agent", "X-Forwarded-For", "X-Real-IP"} {
+			if v := r.Header.Get(header); v != "" {
+				h.logDebug("    %s: %s", header, v)
+			}
+		}
+
+		// Log Authorization header presence (not the value)
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			authType := strings.SplitN(auth, " ", 2)[0]
+			h.logDebug("    Authorization: %s [REDACTED]", authType)
+		}
+
+		// Log Cookie header presence (not the value)
+		if cookies := r.Header.Get("Cookie"); cookies != "" {
+			h.logDebug("    Cookie: [REDACTED, length=%d]", len(cookies))
+		}
+
+		// Wrap response writer to capture status code
+		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		next.ServeHTTP(wrapped, r)
+
+		// Log response
+		h.logDebug("<<< %s %s -> %d (%v)", r.Method, r.URL.Path, wrapped.statusCode, time.Since(start))
+	})
+}
+
+// Root returns the provider's local URL for service discovery
+func (h *Handlers) Root(w http.ResponseWriter, _ *http.Request) {
+	fmt.Fprintf(w, "http://%s", net.JoinHostPort(h.config.ListenHost, h.config.Port))
+}
+
+// GetState returns the current session state including user groups.
+// Groups are extracted using two strategies:
+//  1. Parse groups from ID token claims (primary, faster)
+//  2. Fetch from UserInfo endpoint (fallback)
+func (h *Handlers) GetState(w http.ResponseWriter, r *http.Request) {
+	var sr state.SerializableRequest
+	if err := json.NewDecoder(r.Body).Decode(&sr); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	reqObj, err := http.NewRequest(sr.Method, sr.URL, nil)
+	if err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	reqObj.Header = sr.Header
+
+	ss, err := state.GetSerializableState(h.oauthProxy, reqObj)
+	if err != nil {
+		// Include original error in response body for obot server to detect session expiration.
+		// obot checks for "record not found" or "session ticket cookie failed validation" in the body.
+		http.Error(w, fmt.Sprintf("authentication failed: %v", err), http.StatusInternalServerError)
+		h.logError("get state: %v", err)
+		return
+	}
+
+	ss.GroupInfos = h.extractUserGroups(r.Context(), ss)
+
+	if err := json.NewEncoder(w).Encode(ss); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.logError("encode state: %v", err)
+	}
+}
+
+// extractUserGroups retrieves user groups from ID token or UserInfo endpoint
+func (h *Handlers) extractUserGroups(ctx context.Context, ss state.SerializableState) []state.GroupInfo {
+	// Strategy 1: Parse groups from ID token (primary, no network call)
+	if ss.IDToken != "" {
+		if groups := parseIDTokenForGroups(ss.IDToken); len(groups) > 0 {
+			h.logDebug("ID token groups: %v", groups)
+			return toGroupInfos(groups)
+		}
+	}
+
+	// Strategy 2: Fallback to UserInfo endpoint
+	if ss.AccessToken == "" {
+		return nil
+	}
+
+	h.logDebug("fetching groups from UserInfo: %s", h.config.UserInfoURL())
+	userInfo, err := profile.FetchKeycloakProfile(ctx, bearerPrefix+ss.AccessToken, h.config.UserInfoURL())
+	if err != nil {
+		h.logWarn("fetch groups from userinfo: %v", err)
+		return nil
+	}
+
+	h.logDebug("UserInfo groups: %v", userInfo.Groups)
+	return userInfo.GroupInfos()
+}
+
+// GetUserInfo fetches user profile from Keycloak's UserInfo endpoint
+func (h *Handlers) GetUserInfo(w http.ResponseWriter, r *http.Request) {
+	userInfo, err := profile.FetchKeycloakProfile(r.Context(), r.Header.Get("Authorization"), h.config.UserInfoURL())
+	if err != nil {
+		http.Error(w, "failed to fetch user info", http.StatusBadRequest)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(userInfo)
+}
+
+// ListAuthGroups lists all available groups from Keycloak Admin API.
+// Uses client credentials flow (service account) to access Admin API.
+// Supports optional "name" query parameter for server-side filtering.
+// Returns empty list if group search is disabled or on any error.
+func (h *Handlers) ListAuthGroups(w http.ResponseWriter, r *http.Request) {
+	emptyGroups := []state.GroupInfo{}
+
+	if !h.config.GroupSearchEnabled {
+		h.logDebug("group search disabled")
+		h.writeAuthGroupsPage(w, emptyGroups)
+		return
+	}
+
+	kc, err := h.serviceClient.GetAdminClient(r.Context())
+	if err != nil {
+		h.logWarn("get admin client: %v", err)
+		h.writeAuthGroupsPage(w, emptyGroups)
+		return
+	}
+
+	// Support name filter from query parameter (obot passes ?name=xxx)
+	nameFilter := r.URL.Query().Get("name")
+	groups, err := kc.SearchGroups(r.Context(), nameFilter)
+	if err != nil {
+		h.logWarn("list groups from Admin API: %v", err)
+		h.writeAuthGroupsPage(w, emptyGroups)
+		return
+	}
+
+	h.logDebug("raw groups from API: %d top-level (filter=%q)", len(groups), nameFilter)
+
+	flatGroups := client.FlattenGroups(groups)
+	h.logDebug("total groups after flattening: %d", len(flatGroups))
+	h.writeAuthGroupsPage(w, groupsToInfos(flatGroups))
+}
+
+// ListUserAuthGroups lists groups for a specific user via Keycloak Admin API.
+// Request body contains a user identifier (UUID or email).
+// If the identifier is not a valid UUID, it searches for the user by email first.
+// Returns empty list if group search is disabled or on any error.
+func (h *Handlers) ListUserAuthGroups(w http.ResponseWriter, r *http.Request) {
+	emptyGroups := []state.GroupInfo{}
+
+	// Read user identifier from request body
+	userIdentifier, err := io.ReadAll(r.Body)
+	if err != nil || len(userIdentifier) == 0 {
+		h.logDebug("list user groups: empty or invalid user identifier")
+		h.writeJSON(w, emptyGroups)
+		return
+	}
+
+	if !h.config.GroupSearchEnabled {
+		h.logDebug("group search disabled")
+		h.writeJSON(w, emptyGroups)
+		return
+	}
+
+	kc, err := h.serviceClient.GetAdminClient(r.Context())
+	if err != nil {
+		h.logWarn("get admin client: %v", err)
+		h.writeJSON(w, emptyGroups)
+		return
+	}
+
+	// Resolve user ID: if identifier looks like an email, search for the user first
+	userID := string(userIdentifier)
+	if strings.Contains(userID, "@") {
+		h.logDebug("identifier contains @, searching user by email: %s", userID)
+		users, err := kc.SearchUsers(r.Context(), userID)
+		if err != nil {
+			h.logWarn("search user by email: %v", err)
+			h.writeJSON(w, emptyGroups)
+			return
+		}
+		if len(users) == 0 {
+			h.logDebug("no user found with email: %s", userID)
+			h.writeJSON(w, emptyGroups)
+			return
+		}
+		// Use the first matching user's ID
+		userID = users[0].ID
+		h.logDebug("resolved email %s to user ID: %s", string(userIdentifier), userID)
+	}
+
+	groups, err := kc.GetUserGroups(r.Context(), userID)
+	if err != nil {
+		h.logWarn("get user groups from Admin API: %v", err)
+		h.writeJSON(w, emptyGroups)
+		return
+	}
+
+	h.logDebug("user %s has %d groups", userID, len(groups))
+	h.writeJSON(w, groupsToInfos(groups))
+}
+
+// groupsToInfos converts Keycloak groups to GroupInfo slice.
+// Uses full path for both ID and Name to distinguish groups with the same name
+// under different parent groups (e.g., "/DevTeam/ELK" vs "/OpsTeam/ELK").
+func groupsToInfos(groups []client.Group) []state.GroupInfo {
+	if len(groups) == 0 {
+		return nil
+	}
+	result := make([]state.GroupInfo, len(groups))
+	for i, g := range groups {
+		result[i] = state.GroupInfo{ID: config.GroupID(g.Path), Name: g.Path}
+	}
+	return result
+}
+
+// GetIconURL returns a handler that fetches the user's profile picture URL
+func (h *Handlers) GetIconURL() http.HandlerFunc {
+	return icon.ObotGetIconURL(func(ctx context.Context, accessToken string) (string, error) {
+		userInfo, err := profile.FetchKeycloakProfile(ctx, bearerPrefix+accessToken, h.config.UserInfoURL())
+		if err != nil {
+			return "", err
+		}
+		return userInfo.Picture, nil
+	})
+}
+
+// OAuthProxyHandler returns the underlying oauth2-proxy HTTP handler
+func (h *Handlers) OAuthProxyHandler() http.HandlerFunc {
+	return h.oauthProxy.ServeHTTP
+}
+
+type authGroupsPage struct {
+	Items      []state.GroupInfo `json:"items"`
+	NextCursor string            `json:"nextCursor"`
+}
+
+func (h *Handlers) writeAuthGroupsPage(w http.ResponseWriter, groups []state.GroupInfo) {
+	if groups == nil {
+		groups = []state.GroupInfo{}
+	}
+	h.writeJSON(w, authGroupsPage{Items: groups})
+}
+
+// writeJSON encodes v as JSON to the response writer with proper Content-Type
+func (h *Handlers) writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		h.logError("encode JSON: %v", err)
+	}
+}
+
+func (h *Handlers) logDebug(format string, args ...any) {
+	if h.config.Debug {
+		fmt.Printf("DEBUG: keycloak-auth-provider: "+format+"\n", args...)
+	}
+}
+
+func (h *Handlers) logWarn(format string, args ...any) {
+	fmt.Printf("WARN: keycloak-auth-provider: "+format+"\n", args...)
+}
+
+func (h *Handlers) logError(format string, args ...any) {
+	fmt.Printf("ERROR: keycloak-auth-provider: "+format+"\n", args...)
+}
+
+// toGroupInfos converts group paths to GroupInfo slice
+func toGroupInfos(paths []string) []state.GroupInfo {
+	if len(paths) == 0 {
+		return nil
+	}
+	result := make([]state.GroupInfo, len(paths))
+	for i, path := range paths {
+		result[i] = state.GroupInfo{ID: config.GroupID(path), Name: path}
+	}
+	return result
+}
+
+// parseIDTokenForGroups extracts groups from ID token without validation.
+// Checks groupClaimNames in order and returns first non-empty result.
+func parseIDTokenForGroups(idToken string) []string {
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(idToken, jwt.MapClaims{})
+	if err != nil {
+		return nil
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return nil
+	}
+
+	for _, claimName := range groupClaimNames {
+		if groups := extractStringSlice(claims, claimName); len(groups) > 0 {
+			return groups
+		}
+	}
+	return nil
+}
+
+// extractStringSlice safely extracts a string slice from JWT claims
+func extractStringSlice(claims jwt.MapClaims, key string) []string {
+	arr, ok := claims[key].([]interface{})
+	if !ok {
+		return nil
+	}
+	result := make([]string, 0, len(arr))
+	for _, v := range arr {
+		if s, ok := v.(string); ok {
+			result = append(result, s)
+		}
+	}
+	return result
+}
